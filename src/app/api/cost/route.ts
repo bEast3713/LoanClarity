@@ -101,19 +101,72 @@ export async function GET(req: Request) {
     );
   }
 
-  const { data: rows, error: feeErr } = await supabase
-    .from("course_fees")
-    .select("year,tuition_fee,hostel_fee,exam_fee,misc_fee,updated_at")
-    .eq("college_id", collegeId)
-    .eq("course", course)
-    .order("year", { ascending: true });
+  const courseInput = course.trim();
+  const courseNormalized = courseInput.replace(/\s+/g, " ");
+
+  async function loadFees(opts: { match: "eq" | "ilike"; value: string }) {
+    const q = supabase
+      .from("course_fees")
+      .select("year,tuition_fee,hostel_fee,exam_fee,misc_fee,updated_at")
+      .eq("college_id", collegeId!)
+      .order("year", { ascending: true });
+    return opts.match === "eq"
+      ? await q.eq("course", opts.value)
+      : await q.ilike("course", opts.value);
+  }
+
+  // 1) Try exact match first (fast, uses index)
+  let { data: rows, error: feeErr } = await loadFees({
+    match: "eq",
+    value: courseInput,
+  });
+
+  // 2) If that fails, try case-insensitive match (handles "b.tech cse" vs "B.Tech CSE")
+  if (!feeErr && (rows ?? []).length === 0) {
+    ({ data: rows, error: feeErr } = await loadFees({
+      match: "ilike",
+      value: courseInput,
+    }));
+  }
+
+  // 3) If still empty, try whitespace-normalized match (handles accidental double spaces)
+  if (!feeErr && (rows ?? []).length === 0 && courseNormalized !== courseInput) {
+    ({ data: rows, error: feeErr } = await loadFees({
+      match: "ilike",
+      value: courseNormalized,
+    }));
+  }
 
   if (feeErr) return NextResponse.json({ error: feeErr.message }, { status: 500 });
 
   const safeRows: FeeRow[] = (rows ?? []) as FeeRow[];
   if (safeRows.length === 0) {
+    const { data: available, error: availErr } = await supabase
+      .from("course_fees")
+      .select("course")
+      .eq("college_id", collegeId)
+      .order("course", { ascending: true });
+    if (availErr) {
+      return NextResponse.json({ error: availErr.message }, { status: 500 });
+    }
+    const availableCourses = Array.from(
+      new Set((available ?? []).map((r) => (r as { course: string }).course).filter(Boolean)),
+    );
+
     return NextResponse.json(
-      { error: "No fee data for that college/course (seed only covers a few)." },
+      {
+        error:
+          availableCourses.length > 0
+            ? "No fee data for that exact course name at this college."
+            : "No fee data for this college yet (course_fees is empty).",
+        details: {
+          college_id: collegeId,
+          requested_course: courseInput,
+          available_courses: availableCourses,
+          hint:
+            "Insert rows into public.course_fees for this college_id + course + year, or make sure your course string matches exactly (e.g. 'B.Tech CSE').",
+        },
+      },
       { status: 404 },
     );
   }
